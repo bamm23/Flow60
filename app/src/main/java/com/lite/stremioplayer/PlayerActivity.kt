@@ -6,13 +6,14 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
-import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -23,11 +24,13 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.media3.common.C
+import androidx.media3.common.ColorInfo
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -43,7 +46,7 @@ import java.util.Locale
 class PlayerActivity : Activity() {
 
     private var player: ExoPlayer? = null
-    private lateinit var surfaceView: SurfaceView
+    private lateinit var surfaceView: MemcGLSurfaceView
     private lateinit var subtitleView: SubtitleView
     private lateinit var tvStatus: TextView
     private lateinit var osdContainer: LinearLayout
@@ -54,9 +57,10 @@ class PlayerActivity : Activity() {
     private lateinit var btnSubtitles: Button
     private lateinit var btnAspect: Button
 
-    // Controles opcionales o dinámicos para subtítulos (tamaño, fondo y recarga de addons)
+    // Controles opcionales o dinámicos para subtítulos y MEMC 60 FPS
     private var btnSubStyle: Button? = null
     private var btnReloadSubs: Button? = null
+    private var btnMemc: Button? = null
 
     private val handler = Handler(Looper.getMainLooper())
     private var lastKnownPositionMs: Long = 0L
@@ -66,6 +70,11 @@ class PlayerActivity : Activity() {
     private var isVerticalStretch = true
     private var currentVideoWidth = 0
     private var currentVideoHeight = 0
+
+    // Estado de interpolación MEMC y control térmico
+    private var userWantsMemc = true
+    private var memcBypassReason: String? = null
+    private var thermalTickCounter = 0
 
     // Lista en memoria de subtítulos externos (Intent + Addons de Stremio)
     private val loadedExternalSubs = mutableListOf<MediaItem.SubtitleConfiguration>()
@@ -99,6 +108,13 @@ class PlayerActivity : Activity() {
                     progressBar.progress = ((pos * 1000) / dur).toInt()
                 }
             }
+
+            thermalTickCounter++
+            if (thermalTickCounter >= 15) { // 15 * 2s = 30 segundos
+                thermalTickCounter = 0
+                checkThermalStatus()
+            }
+
             handler.postDelayed(this, 2000)
         }
     }
@@ -123,11 +139,17 @@ class PlayerActivity : Activity() {
         btnSubtitles = findViewById(R.id.btnSubtitles)
         btnAspect = findViewById(R.id.btnAspect)
 
-        // Cargar preferencias guardadas de tamaño y fondo de subtítulos
+        // Cargar preferencias guardadas de subtítulos y MEMC
         val prefs = getSharedPreferences("player_prefs", Context.MODE_PRIVATE)
         subSizeIndex = prefs.getInt("sub_size_index", 2).coerceIn(0, subSizeValues.lastIndex)
         subBgIndex = prefs.getInt("sub_bg_index", 0).coerceIn(0, subBgValues.lastIndex)
+        userWantsMemc = prefs.getBoolean("memc_enabled", true)
         applySubtitleStyle()
+
+        // Vincular el Surface OpenGL con ExoPlayer cuando el contexto EGL esté listo
+        surfaceView.setOnSurfaceReadyListener { surface ->
+            player?.setVideoSurface(surface)
+        }
 
         // Vincular o inyectar botones adicionales en la barra de controles sin requerir cambios obligatorios en XML
         setupExtraButtons()
@@ -160,9 +182,11 @@ class PlayerActivity : Activity() {
         // Intentar encontrar si el usuario ya los definió en activity_player.xml por ID dinámico
         val idSubStyle = resources.getIdentifier("btnSubStyle", "id", packageName)
         val idReloadSubs = resources.getIdentifier("btnReloadSubs", "id", packageName)
+        val idMemc = resources.getIdentifier("btnMemc", "id", packageName)
 
         btnSubStyle = if (idSubStyle != 0) findViewById(idSubStyle) else null
         btnReloadSubs = if (idReloadSubs != 0) findViewById(idReloadSubs) else null
+        btnMemc = if (idMemc != 0) findViewById(idMemc) else null
 
         val marginPx = TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP, 12f, resources.displayMetrics
@@ -192,6 +216,17 @@ class PlayerActivity : Activity() {
             buttonRow.addView(btnReloadSubs)
         }
 
+        if (btnMemc == null) {
+            btnMemc = Button(this).apply {
+                isFocusable = true
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = marginPx }
+            }
+            buttonRow.addView(btnMemc)
+        }
+
         btnSubStyle?.setOnClickListener {
             showSubtitleAppearanceDialog()
         }
@@ -200,6 +235,27 @@ class PlayerActivity : Activity() {
             fetchSubtitlesFromStremioAddons(isManualReload = true)
             resetOsdTimer()
         }
+
+        btnMemc?.setOnClickListener {
+            if (memcBypassReason != null) {
+                Toast.makeText(
+                    this@PlayerActivity,
+                    "60 FPS desactivado automáticamente ($memcBypassReason)",
+                    Toast.LENGTH_LONG
+                ).show()
+                resetOsdTimer()
+                return@setOnClickListener
+            }
+            userWantsMemc = !userWantsMemc
+            getSharedPreferences("player_prefs", Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean("memc_enabled", userWantsMemc)
+                .apply()
+            applyMemcState()
+            resetOsdTimer()
+        }
+
+        applyMemcState()
     }
 
     private fun applySubtitleStyle() {
@@ -323,6 +379,7 @@ class PlayerActivity : Activity() {
             .setSubtitleConfigurations(loadedExternalSubs.toList())
             .build()
 
+        surfaceView.resetFrames()
         exo.setMediaItem(updatedMediaItem, currentPos)
         exo.prepare()
         exo.playWhenReady = wasPlaying
@@ -402,11 +459,16 @@ class PlayerActivity : Activity() {
         val renderersFactory = DefaultRenderersFactory(this)
             .setEnableDecoderFallback(true)
 
+        // Reiniciar estado de fotogramas previos al cambiar de episodio/video
+        surfaceView.resetFrames()
+        memcBypassReason = null
+        thermalTickCounter = 0
+
         player = ExoPlayer.Builder(this, renderersFactory)
             .setMediaSourceFactory(mediaSourceFactory)
             .setLoadControl(loadControl)
             .build().apply {
-                setVideoSurfaceView(surfaceView)
+                surfaceView.getVideoSurface()?.let { setVideoSurface(it) }
                 addListener(playerListener)
 
                 val mediaItem = MediaItem.Builder()
@@ -422,6 +484,8 @@ class PlayerActivity : Activity() {
                 playWhenReady = true
             }
 
+        checkThermalStatus()
+        applyMemcState()
         handler.post(progressRunnable)
     }
 
@@ -433,7 +497,27 @@ class PlayerActivity : Activity() {
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             currentVideoWidth = videoSize.width
             currentVideoHeight = videoSize.height
+            surfaceView.setVideoSize(videoSize.width, videoSize.height)
+            evaluateAutoBypass()
             applyAspectRatio()
+        }
+
+        override fun onTracksChanged(tracks: Tracks) {
+            evaluateAutoBypass()
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            surfaceView.setPlaying(isPlaying)
+        }
+
+        override fun onPositionDiscontinuity(
+            oldPosition: Player.PositionInfo,
+            newPosition: Player.PositionInfo,
+            reason: Int
+        ) {
+            if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                surfaceView.resetFrames()
+            }
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -464,11 +548,60 @@ class PlayerActivity : Activity() {
 
             handler.postDelayed({
                 player?.let {
+                    surfaceView.resetFrames()
                     it.seekTo(lastKnownPositionMs)
                     it.prepare()
                     it.playWhenReady = true
                 }
             }, 2500)
+        }
+    }
+
+    private fun evaluateAutoBypass() {
+        val format = player?.videoFormat
+        val is4k = currentVideoWidth > 1920 || currentVideoHeight > 1080
+        val isHighFps = format != null && format.frameRate > 45f
+        val isHdr = format?.colorInfo != null && ColorInfo.isTransferHdr(format.colorInfo)
+
+        val newReason = when {
+            memcBypassReason == "Temperatura alta" -> "Temperatura alta"
+            is4k -> "Video 4K"
+            isHdr -> "Video HDR"
+            isHighFps -> "Ya es 50/60 FPS"
+            else -> null
+        }
+        memcBypassReason = newReason
+        applyMemcState()
+    }
+
+    private fun checkThermalStatus() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+        val status = pm.currentThermalStatus
+
+        if (status >= PowerManager.THERMAL_STATUS_MODERATE) {
+            if (memcBypassReason != "Temperatura alta") {
+                memcBypassReason = "Temperatura alta"
+                applyMemcState()
+                Toast.makeText(
+                    this,
+                    "Temperatura alta: 60 FPS pausado para proteger el dispositivo",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        } else if (status <= PowerManager.THERMAL_STATUS_LIGHT && memcBypassReason == "Temperatura alta") {
+            memcBypassReason = null
+            evaluateAutoBypass()
+        }
+    }
+
+    private fun applyMemcState() {
+        val active = userWantsMemc && memcBypassReason == null
+        surfaceView.setMemcEnabled(active)
+        btnMemc?.text = when {
+            memcBypassReason != null -> "60 FPS: Auto-OFF"
+            active -> "60 FPS: ON"
+            else -> "60 FPS: OFF"
         }
     }
 
@@ -661,9 +794,20 @@ class PlayerActivity : Activity() {
         handler.removeCallbacks(progressRunnable)
         player?.let {
             if (it.currentPosition > 0) savePosition(it.currentPosition)
+            it.clearVideoSurface()
             it.release()
         }
         player = null
+    }
+
+    override fun onResume() {
+        super.onResume()
+        surfaceView.onResume()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        surfaceView.onPause()
     }
 
     override fun onStop() {
@@ -676,6 +820,7 @@ class PlayerActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        surfaceView.releaseResources()
         releasePlayer()
     }
 }
