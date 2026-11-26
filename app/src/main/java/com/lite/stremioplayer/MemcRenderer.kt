@@ -42,8 +42,10 @@ class MemcRenderer(
     private val frameFbo = IntArray(2)
     private val lumaTex = IntArray(2)
     private val lumaFbo = IntArray(2)
-    private var mvTex = 0
-    private var mvFbo = 0
+    private var mvTexA = 0
+    private var mvFboA = 0
+    private var mvTexB = 0
+    private var mvFboB = 0
 
     // Ping-pong de fotogramas y temporización
     private var currIdx = 0
@@ -56,14 +58,18 @@ class MemcRenderer(
     private var progPassthrough = 0
     private var progLuma = 0
     private var progMe = 0
+    private var progMvBlur = 0
     private var progWarp = 0
 
     // Uniforms cacheados
     private var uPtMatrix = -1
     private var uLumaTex = -1
+    private var uLumaSrcTexel = -1
     private var uMePrev = -1
     private var uMeCurr = -1
     private var uMeTexel = -1
+    private var uBlurMv = -1
+    private var uBlurTexel = -1
     private var uWarpPrev = -1
     private var uWarpCurr = -1
     private var uWarpMv = -1
@@ -127,11 +133,16 @@ class MemcRenderer(
 
         progLuma = buildProgram(VS_STD, FS_LUMA)
         uLumaTex = GLES30.glGetUniformLocation(progLuma, "uTex")
+        uLumaSrcTexel = GLES30.glGetUniformLocation(progLuma, "uSrcTexel")
 
-        progMe = buildProgram(VS_STD, FS_ME_DIAMOND)
+        progMe = buildProgram(VS_STD, FS_ME_LK)
         uMePrev = GLES30.glGetUniformLocation(progMe, "uPrevLuma")
         uMeCurr = GLES30.glGetUniformLocation(progMe, "uCurrLuma")
         uMeTexel = GLES30.glGetUniformLocation(progMe, "uTexelSize")
+
+        progMvBlur = buildProgram(VS_STD, FS_MV_BLUR)
+        uBlurMv = GLES30.glGetUniformLocation(progMvBlur, "uMvTex")
+        uBlurTexel = GLES30.glGetUniformLocation(progMvBlur, "uTexelSize")
 
         progWarp = buildProgram(VS_STD, FS_WARP)
         uWarpPrev = GLES30.glGetUniformLocation(progWarp, "uPrevTex")
@@ -170,7 +181,7 @@ class MemcRenderer(
             st.getTransformMatrix(stMatrix)
         }
 
-        // Si MEMC está desactivado: dibujado directo sin tocar FBOs (mínimo consumo/calor)
+        // Modo Pass-through (MEMC OFF): mínimo consumo y calor
         if (!memcEnabled) {
             hasPrevFrame = false
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
@@ -196,7 +207,7 @@ class MemcRenderer(
 
         val nowNs = System.nanoTime()
 
-        // Solo al llegar un nuevo fotograma real (24/25/30 veces/seg) calculamos luma y flujo óptico
+        // Solo al llegar un fotograma nuevo (24/25/30 Hz) calculamos luma, flujo óptico y suavizado
         if (gotNewFrame) {
             if (lastFrameNs != 0L) {
                 val delta = nowNs - lastFrameNs
@@ -204,13 +215,11 @@ class MemcRenderer(
                     frameIntervalNs = (frameIntervalNs * 0.8 + delta * 0.2).toLong()
                     hasPrevFrame = true
                 } else if (delta > 200_000_000L) {
-                    // Salto grande (seek o pausa larga): evitar interpolar entre escenas distintas
                     hasPrevFrame = false
                 }
             }
             lastFrameNs = nowNs
 
-            // Intercambiar índices ping-pong
             val tmp = prevIdx
             prevIdx = currIdx
             currIdx = tmp
@@ -224,18 +233,19 @@ class MemcRenderer(
             GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, extTexId)
             drawQuad()
 
-            // Pase 2: Reducir a luminancia 1/8 (GL_R8)
+            // Pase 2: Luminancia reducida 1/8 con filtro anti-aliasing (4 muestras bilineales)
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, lumaFbo[currIdx])
             GLES30.glViewport(0, 0, lumaW, lumaH)
             GLES30.glUseProgram(progLuma)
             GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, frameTex[currIdx])
             GLES30.glUniform1i(uLumaTex, 0)
+            GLES30.glUniform2f(uLumaSrcTexel, 1f / allocatedW, 1f / allocatedH)
             drawQuad()
 
-            // Pase 3: Estimación de movimiento (Diamond Search)
             if (hasPrevFrame) {
-                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, mvFbo)
+                // Pase 3: Flujo óptico continuo sub-píxel (Lucas-Kanade 2 iteraciones)
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, mvFboA)
                 GLES30.glViewport(0, 0, lumaW, lumaH)
                 GLES30.glUseProgram(progMe)
                 GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
@@ -246,10 +256,20 @@ class MemcRenderer(
                 GLES30.glUniform1i(uMeCurr, 1)
                 GLES30.glUniform2f(uMeTexel, 1f / lumaW, 1f / lumaH)
                 drawQuad()
+
+                // Pase 4: Suavizado espacial de vectores (elimina los cuadritos temblando)
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, mvFboB)
+                GLES30.glViewport(0, 0, lumaW, lumaH)
+                GLES30.glUseProgram(progMvBlur)
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, mvTexA)
+                GLES30.glUniform1i(uBlurMv, 0)
+                GLES30.glUniform2f(uBlurTexel, 1f / lumaW, 1f / lumaH)
+                drawQuad()
             }
         }
 
-        // Pase 4 (60 Hz): Warping bidireccional directo a pantalla
+        // Pase 5 (60 Hz): Warping bidireccional suave con protección de bordes y cortes
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glViewport(0, 0, surfaceWidth, surfaceHeight)
 
@@ -275,7 +295,7 @@ class MemcRenderer(
         GLES30.glUniform1i(uWarpCurr, 1)
 
         GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, mvTex)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, mvTexB)
         GLES30.glUniform1i(uWarpMv, 2)
 
         GLES30.glUniform1f(uWarpAlpha, alpha)
@@ -300,9 +320,13 @@ class MemcRenderer(
             lumaTex[i] = l.first
             lumaFbo[i] = l.second
         }
-        val m = createFboTexture(lumaW, lumaH, GLES30.GL_RGBA8, GLES30.GL_RGBA)
-        mvTex = m.first
-        mvFbo = m.second
+        val mA = createFboTexture(lumaW, lumaH, GLES30.GL_RGBA8, GLES30.GL_RGBA)
+        mvTexA = mA.first
+        mvFboA = mA.second
+
+        val mB = createFboTexture(lumaW, lumaH, GLES30.GL_RGBA8, GLES30.GL_RGBA)
+        mvTexB = mB.first
+        mvFboB = mB.second
     }
 
     private fun createFboTexture(w: Int, h: Int, internalFormat: Int, format: Int): Pair<Int, Int> {
@@ -329,11 +353,14 @@ class MemcRenderer(
         GLES30.glDeleteFramebuffers(2, frameFbo, 0)
         GLES30.glDeleteTextures(2, lumaTex, 0)
         GLES30.glDeleteFramebuffers(2, lumaFbo, 0)
-        if (mvTex != 0) GLES30.glDeleteTextures(1, intArrayOf(mvTex), 0)
-        if (mvFbo != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(mvFbo), 0)
+        if (mvTexA != 0) GLES30.glDeleteTextures(1, intArrayOf(mvTexA), 0)
+        if (mvFboA != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(mvFboA), 0)
+        if (mvTexB != 0) GLES30.glDeleteTextures(1, intArrayOf(mvTexB), 0)
+        if (mvFboB != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(mvFboB), 0)
         frameTex.fill(0); frameFbo.fill(0)
         lumaTex.fill(0); lumaFbo.fill(0)
-        mvTex = 0; mvFbo = 0
+        mvTexA = 0; mvFboA = 0
+        mvTexB = 0; mvFboB = 0
         allocatedW = 0; allocatedH = 0
     }
 
@@ -350,10 +377,10 @@ class MemcRenderer(
             GLES30.glDeleteTextures(1, intArrayOf(extTexId), 0)
             extTexId = 0
         }
-        listOf(progPassthrough, progLuma, progMe, progWarp).forEach {
+        listOf(progPassthrough, progLuma, progMe, progMvBlur, progWarp).forEach {
             if (it != 0) GLES30.glDeleteProgram(it)
         }
-        progPassthrough = 0; progLuma = 0; progMe = 0; progWarp = 0
+        progPassthrough = 0; progLuma = 0; progMe = 0; progMvBlur = 0; progWarp = 0
         releaseSurfaceOnly()
     }
 
@@ -422,21 +449,29 @@ class MemcRenderer(
             }
         """.trimIndent()
 
+        // Downscale 1/8 con filtro de área (4 muestras bilineales = promedio de 16 píxeles)
         private val FS_LUMA = """
             #version 300 es
             precision mediump float;
             in vec2 vTexCoord;
             uniform sampler2D uTex;
+            uniform vec2 uSrcTexel;
             out vec4 fragColor;
             void main() {
-                vec3 rgb = texture(uTex, vTexCoord).rgb;
-                float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+                vec2 o1 = uSrcTexel * 2.0;
+                vec2 o2 = vec2(o1.x, -o1.y);
+                vec3 c = texture(uTex, vTexCoord + o1).rgb
+                       + texture(uTex, vTexCoord - o1).rgb
+                       + texture(uTex, vTexCoord + o2).rgb
+                       + texture(uTex, vTexCoord - o2).rgb;
+                float y = dot(c * 0.25, vec3(0.2126, 0.7152, 0.0722));
                 fragColor = vec4(y, 0.0, 0.0, 1.0);
             }
         """.trimIndent()
 
-        // Búsqueda en diamante simétrica (máximo desplazamiento ±7 px en mapa 1/8 = ±56 px en 1080p)
-        private val FS_ME_DIAMOND = """
+        // Flujo óptico continuo Lucas-Kanade (2 iteraciones simétricas, precisión sub-píxel)
+        // MAX_DISP = 4.0 px en mapa 1/8 = ±32 px por fotograma en 1080p
+        private val FS_ME_LK = """
             #version 300 es
             precision mediump float;
             in vec2 vTexCoord;
@@ -445,61 +480,125 @@ class MemcRenderer(
             uniform vec2 uTexelSize;
             out vec4 fragColor;
 
-            const float MAX_DISP = 7.0;
+            const float MAX_DISP = 4.0;
+            const float REG_LAMBDA = 0.012;
 
-            float patchSad(vec2 uv, vec2 flowPx) {
-                vec2 halfV = flowPx * 0.5 * uTexelSize;
-                vec2 uvP = uv - halfV;
-                vec2 uvC = uv + halfV;
+            vec2 lkStep(vec2 uv, vec2 initV, out float avgErr) {
+                float sxx = REG_LAMBDA;
+                float syy = REG_LAMBDA;
+                float sxy = 0.0;
+                float sxt = 0.0;
+                float syt = 0.0;
+                float errSum = 0.0;
+
                 vec2 dx = vec2(uTexelSize.x, 0.0);
                 vec2 dy = vec2(0.0, uTexelSize.y);
+                vec2 halfShift = initV * 0.5 * uTexelSize;
 
-                float s = abs(texture(uPrevLuma, uvP).r - texture(uCurrLuma, uvC).r);
-                s += abs(texture(uPrevLuma, uvP + dx).r - texture(uCurrLuma, uvC + dx).r);
-                s += abs(texture(uPrevLuma, uvP - dx).r - texture(uCurrLuma, uvC - dx).r);
-                s += abs(texture(uPrevLuma, uvP + dy).r - texture(uCurrLuma, uvC + dy).r);
-                s += abs(texture(uPrevLuma, uvP - dy).r - texture(uCurrLuma, uvC - dy).r);
-                return s * 0.2;
-            }
+                for (int j = -1; j <= 1; j++) {
+                    for (int i = -1; i <= 1; i++) {
+                        vec2 off = vec2(float(i), float(j)) * uTexelSize * 1.5;
+                        vec2 uvP = uv + off - halfShift;
+                        vec2 uvC = uv + off + halfShift;
 
-            void main() {
-                vec2 bestV = vec2(0.0);
-                float bestSad = patchSad(vTexCoord, bestV);
+                        float p0 = texture(uPrevLuma, uvP).r;
+                        float c0 = texture(uCurrLuma, uvC).r;
+                        float it = c0 - p0;
 
-                // Zona estática: ahorrar cálculos y evitar vibración en subtítulos/fondos
-                if (bestSad > 0.015) {
-                    float steps[3];
-                    steps[0] = 4.0;
-                    steps[1] = 2.0;
-                    steps[2] = 1.0;
+                        float ix = 0.25 * (
+                            (texture(uPrevLuma, uvP + dx).r - texture(uPrevLuma, uvP - dx).r) +
+                            (texture(uCurrLuma, uvC + dx).r - texture(uCurrLuma, uvC - dx).r)
+                        );
+                        float iy = 0.25 * (
+                            (texture(uPrevLuma, uvP + dy).r - texture(uPrevLuma, uvP - dy).r) +
+                            (texture(uCurrLuma, uvC + dy).r - texture(uCurrLuma, uvC - dy).r)
+                        );
 
-                    for (int i = 0; i < 3; i++) {
-                        float r = steps[i];
-                        vec2 base = bestV;
-                        vec2 dirs[4];
-                        dirs[0] = vec2( r, 0.0);
-                        dirs[1] = vec2(-r, 0.0);
-                        dirs[2] = vec2(0.0,  r);
-                        dirs[3] = vec2(0.0, -r);
-
-                        for (int d = 0; d < 4; d++) {
-                            vec2 cand = clamp(base + dirs[d], vec2(-MAX_DISP), vec2(MAX_DISP));
-                            float sad = patchSad(vTexCoord, cand);
-                            if (sad < bestSad) {
-                                bestSad = sad;
-                                bestV = cand;
-                            }
-                        }
+                        sxx += ix * ix;
+                        syy += iy * iy;
+                        sxy += ix * iy;
+                        sxt += ix * it;
+                        syt += iy * it;
+                        errSum += abs(it);
                     }
                 }
 
-                // Confianza: cae a 0 en cortes bruscos de escena o movimientos extremos
-                float confidence = 1.0 - smoothstep(0.08, 0.20, bestSad);
-                vec2 encoded = (bestV / MAX_DISP) * 0.5 + 0.5;
-                fragColor = vec4(encoded, confidence, 1.0);
+                avgErr = errSum / 9.0;
+                float det = sxx * syy - sxy * sxy;
+                if (det < 1e-6) return vec2(0.0);
+
+                vec2 dv = vec2(
+                    -(syy * sxt - sxy * syt),
+                    -(sxx * syt - sxy * sxt)
+                ) / det;
+
+                return clamp(dv, vec2(-2.5), vec2(2.5));
+            }
+
+            void main() {
+                float err1 = 0.0;
+                vec2 v = lkStep(vTexCoord, vec2(0.0), err1);
+
+                // Segunda iteración de refinamiento si hay movimiento apreciable
+                float finalErr = err1;
+                if (length(v) > 0.15) {
+                    vec2 dv = lkStep(vTexCoord, v, finalErr);
+                    v = clamp(v + dv, vec2(-MAX_DISP), vec2(MAX_DISP));
+                }
+
+                // Confianza: cae a 0 en cortes de escena o ruido fuerte
+                float conf = 1.0 - smoothstep(0.07, 0.19, finalErr);
+
+                // Codificación con cero exacto en 128/255 (sin micro-temblor en fondos quietos)
+                vec2 encoded = floor((v / MAX_DISP) * 127.0 + 128.5) / 255.0;
+                fragColor = vec4(encoded, conf, 1.0);
             }
         """.trimIndent()
 
+        // Suavizado espacial 5x5 sobre el mapa de vectores (cohesión de bloques)
+        private val FS_MV_BLUR = """
+            #version 300 es
+            precision mediump float;
+            in vec2 vTexCoord;
+            uniform sampler2D uMvTex;
+            uniform vec2 uTexelSize;
+            out vec4 fragColor;
+
+            const float MAX_DISP = 4.0;
+
+            void main() {
+                vec2 sumV = vec2(0.0);
+                float sumC = 0.0;
+                float sumW = 0.0;
+
+                for (int j = -1; j <= 1; j++) {
+                    for (int i = -1; i <= 1; i++) {
+                        vec2 off = vec2(float(i), float(j)) * uTexelSize * 1.5;
+                        vec3 s = texture(uMvTex, vTexCoord + off).rgb;
+                        vec2 v = ((s.rg * 255.0) - 128.0) / 127.0 * MAX_DISP;
+                        float c = s.b;
+                        float w = (i == 0 && j == 0) ? 2.0 : 1.0;
+
+                        sumV += v * (c * w);
+                        sumC += c * w;
+                        sumW += w;
+                    }
+                }
+
+                vec2 avgV = (sumC > 0.001) ? (sumV / sumC) : vec2(0.0);
+                float avgC = sumC / sumW;
+
+                // Zona muerta para mantener fondos quietos 100% estables
+                if (length(avgV) < 0.08) {
+                    avgV = vec2(0.0);
+                }
+
+                vec2 encoded = floor((avgV / MAX_DISP) * 127.0 + 128.5) / 255.0;
+                fragColor = vec4(encoded, avgC, 1.0);
+            }
+        """.trimIndent()
+
+        // Warping bidireccional suave con chequeo de oclusión por píxel
         private val FS_WARP = """
             #version 300 es
             precision mediump float;
@@ -511,13 +610,34 @@ class MemcRenderer(
             uniform vec2 uLumaSize;
             out vec4 fragColor;
 
-            const float MAX_DISP = 7.0;
+            const float MAX_DISP = 4.0;
 
-           void main() {
-    vec3 prev = texture(uPrevTex, vTexCoord).rgb;
-    vec3 curr = texture(uCurrTex, vTexCoord).rgb;
-    fragColor = vec4(mix(prev, curr, uAlpha), 1.0);
-}
+            void main() {
+                vec3 mvData = texture(uMvTex, vTexCoord).rgb;
+                vec2 flowPx = ((mvData.rg * 255.0) - 128.0) / 127.0 * MAX_DISP;
+                float conf = mvData.b;
+
+                vec2 flowUv = flowPx / uLumaSize;
+
+                vec2 uvPrev = clamp(vTexCoord - flowUv * uAlpha, 0.0, 1.0);
+                vec2 uvCurr = clamp(vTexCoord + flowUv * (1.0 - uAlpha), 0.0, 1.0);
+
+                vec3 prevCol = texture(uPrevTex, uvPrev).rgb;
+                vec3 currCol = texture(uCurrTex, uvCurr).rgb;
+                vec3 warped = mix(prevCol, currCol, uAlpha);
+
+                // Verificación de oclusión: si los píxeles deformados no coinciden,
+                // evita halos o rasgaduras en bordes de objetos rápidos
+                float lumaDiff = abs(dot(prevCol - currCol, vec3(0.299, 0.587, 0.114)));
+                float matchConf = 1.0 - smoothstep(0.10, 0.28, lumaDiff);
+                float finalConf = conf * matchConf;
+
+                vec3 fallback = (uAlpha < 0.5)
+                    ? texture(uPrevTex, vTexCoord).rgb
+                    : texture(uCurrTex, vTexCoord).rgb;
+
+                fragColor = vec4(mix(fallback, warped, finalConf), 1.0);
+            }
         """.trimIndent()
     }
 }
