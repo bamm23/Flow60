@@ -513,28 +513,11 @@ class MemcRenderer(
 
             const float MAX_DISP = 7.0;
 
-            void main() {
-                vec3 mvData = texture(uMvTex, vTexCoord).rgb;
-                vec2 flowPx = (mvData.rg * 2.0 - 1.0) * MAX_DISP;
-                vec2 flowUv = flowPx / uLumaSize;
-                float conf = mvData.b;
-
-                vec2 uvPrev = clamp(vTexCoord - flowUv * uAlpha, 0.0, 1.0);
-                vec2 uvCurr = clamp(vTexCoord + flowUv * (1.0 - uAlpha), 0.0, 1.0);
-
-                vec3 warped = mix(
-                    texture(uPrevTex, uvPrev).rgb,
-                    texture(uCurrTex, uvCurr).rgb,
-                    uAlpha
-                );
-
-                // Respaldo limpio sin efecto fantasma en cortes de escena
-                vec3 fallback = (uAlpha < 0.5)
-                    ? texture(uPrevTex, vTexCoord).rgb
-                    : texture(uCurrTex, vTexCoord).rgb;
-
-                fragColor = vec4(mix(fallback, warped, conf), 1.0);
-            }
+           void main() {
+    vec3 prev = texture(uPrevTex, vTexCoord).rgb;
+    vec3 curr = texture(uCurrTex, vTexCoord).rgb;
+    fragColor = vec4(mix(prev, curr, uAlpha), 1.0);
+}
         """.trimIndent()
     }
 }
