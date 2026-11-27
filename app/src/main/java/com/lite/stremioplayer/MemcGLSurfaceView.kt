@@ -58,6 +58,15 @@ class MemcGLSurfaceView @JvmOverloads constructor(
         updateRenderMode()
     }
 
+    fun setImageEnhancements(sharpness: Float, contrast: Float, saturation: Float) {
+        renderer.sharpness = sharpness
+        renderer.contrast = contrast
+        renderer.saturation = saturation
+        if (renderMode == RENDERMODE_WHEN_DIRTY) {
+            requestRender()
+        }
+    }
+
     fun resetFrames() {
         renderer.resetFrames()
     }
