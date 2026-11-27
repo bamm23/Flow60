@@ -12,7 +12,7 @@ class MemcGLSurfaceView @JvmOverloads constructor(
 
     private var surfaceReadyCallback: ((Surface) -> Unit)? = null
     private var isPlaying = false
-    private var isMemcActive = false
+    private var currentMemcMode = MemcRenderer.MODE_OFF
 
     private val renderer: MemcRenderer
 
@@ -51,10 +51,12 @@ class MemcGLSurfaceView @JvmOverloads constructor(
         updateRenderMode()
     }
 
-    fun setMemcEnabled(enabled: Boolean) {
-        isMemcActive = enabled
-        renderer.memcEnabled = enabled
-        if (!enabled) renderer.resetFrames()
+    fun setMemcMode(mode: Int) {
+        currentMemcMode = mode.coerceIn(MemcRenderer.MODE_OFF, MemcRenderer.MODE_FLUID)
+        renderer.memcMode = currentMemcMode
+        if (currentMemcMode == MemcRenderer.MODE_OFF) {
+            renderer.resetFrames()
+        }
         updateRenderMode()
     }
 
@@ -76,7 +78,7 @@ class MemcGLSurfaceView @JvmOverloads constructor(
     }
 
     private fun updateRenderMode() {
-        renderMode = if (isPlaying && isMemcActive) {
+        renderMode = if (isPlaying && currentMemcMode != MemcRenderer.MODE_OFF) {
             RENDERMODE_CONTINUOUSLY
         } else {
             RENDERMODE_WHEN_DIRTY
