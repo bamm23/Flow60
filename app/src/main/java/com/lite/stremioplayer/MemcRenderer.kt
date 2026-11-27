@@ -31,6 +31,8 @@ class MemcRenderer(
     private var allocatedH = 0
     private var lumaW = 0
     private var lumaH = 0
+    private var coarseW = 0
+    private var coarseH = 0
 
     private var surfaceTexture: SurfaceTexture? = null
     private var videoSurface: Surface? = null
@@ -42,6 +44,10 @@ class MemcRenderer(
     private val frameFbo = IntArray(2)
     private val lumaTex = IntArray(2)
     private val lumaFbo = IntArray(2)
+    private val coarseLumaTex = IntArray(2)
+    private val coarseLumaFbo = IntArray(2)
+    private var mvCoarseTex = 0
+    private var mvCoarseFbo = 0
     private var mvTexA = 0
     private var mvFboA = 0
     private var mvTexB = 0
@@ -57,19 +63,27 @@ class MemcRenderer(
     // Programas Shader
     private var progPassthrough = 0
     private var progLuma = 0
-    private var progMe = 0
-    private var progMvBlur = 0
+    private var progDown2 = 0
+    private var progMeCoarse = 0
+    private var progMeFine = 0
+    private var progMvBlurSep = 0
     private var progWarp = 0
 
     // Uniforms cacheados
     private var uPtMatrix = -1
     private var uLumaTex = -1
     private var uLumaSrcTexel = -1
-    private var uMePrev = -1
-    private var uMeCurr = -1
-    private var uMeTexel = -1
+    private var uDownTex = -1
+    private var uDownSrcTexel = -1
+    private var uCoarsePrev = -1
+    private var uCoarseCurr = -1
+    private var uCoarseTexel = -1
+    private var uFinePrev = -1
+    private var uFineCurr = -1
+    private var uFineInitMv = -1
+    private var uFineTexel = -1
     private var uBlurMv = -1
-    private var uBlurTexel = -1
+    private var uBlurStep = -1
     private var uWarpPrev = -1
     private var uWarpCurr = -1
     private var uWarpMv = -1
@@ -135,14 +149,24 @@ class MemcRenderer(
         uLumaTex = GLES30.glGetUniformLocation(progLuma, "uTex")
         uLumaSrcTexel = GLES30.glGetUniformLocation(progLuma, "uSrcTexel")
 
-        progMe = buildProgram(VS_STD, FS_ME_LK)
-        uMePrev = GLES30.glGetUniformLocation(progMe, "uPrevLuma")
-        uMeCurr = GLES30.glGetUniformLocation(progMe, "uCurrLuma")
-        uMeTexel = GLES30.glGetUniformLocation(progMe, "uTexelSize")
+        progDown2 = buildProgram(VS_STD, FS_DOWN2_LUMA)
+        uDownTex = GLES30.glGetUniformLocation(progDown2, "uTex")
+        uDownSrcTexel = GLES30.glGetUniformLocation(progDown2, "uSrcTexel")
 
-        progMvBlur = buildProgram(VS_STD, FS_MV_BLUR)
-        uBlurMv = GLES30.glGetUniformLocation(progMvBlur, "uMvTex")
-        uBlurTexel = GLES30.glGetUniformLocation(progMvBlur, "uTexelSize")
+        progMeCoarse = buildProgram(VS_STD, FS_ME_COARSE)
+        uCoarsePrev = GLES30.glGetUniformLocation(progMeCoarse, "uPrevLuma")
+        uCoarseCurr = GLES30.glGetUniformLocation(progMeCoarse, "uCurrLuma")
+        uCoarseTexel = GLES30.glGetUniformLocation(progMeCoarse, "uTexelSize")
+
+        progMeFine = buildProgram(VS_STD, FS_ME_FINE)
+        uFinePrev = GLES30.glGetUniformLocation(progMeFine, "uPrevLuma")
+        uFineCurr = GLES30.glGetUniformLocation(progMeFine, "uCurrLuma")
+        uFineInitMv = GLES30.glGetUniformLocation(progMeFine, "uCoarseMv")
+        uFineTexel = GLES30.glGetUniformLocation(progMeFine, "uTexelSize")
+
+        progMvBlurSep = buildProgram(VS_STD, FS_MV_BLUR_SEP)
+        uBlurMv = GLES30.glGetUniformLocation(progMvBlurSep, "uMvTex")
+        uBlurStep = GLES30.glGetUniformLocation(progMvBlurSep, "uStep")
 
         progWarp = buildProgram(VS_STD, FS_WARP)
         uWarpPrev = GLES30.glGetUniformLocation(progWarp, "uPrevTex")
@@ -207,12 +231,12 @@ class MemcRenderer(
 
         val nowNs = System.nanoTime()
 
-        // Solo al llegar un fotograma nuevo (24/25/30 Hz) calculamos luma, flujo óptico y suavizado
+        // Solo al llegar un fotograma nuevo (24/25/30 Hz) ejecutamos la pirámide de movimiento
         if (gotNewFrame) {
             if (lastFrameNs != 0L) {
                 val delta = nowNs - lastFrameNs
                 if (delta in 15_000_000L..100_000_000L) {
-                    frameIntervalNs = (frameIntervalNs * 0.8 + delta * 0.2).toLong()
+                    frameIntervalNs = (frameIntervalNs * 0.85 + delta * 0.15).toLong()
                     hasPrevFrame = true
                 } else if (delta > 200_000_000L) {
                     hasPrevFrame = false
@@ -233,7 +257,7 @@ class MemcRenderer(
             GLES30.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, extTexId)
             drawQuad()
 
-            // Pase 2: Luminancia reducida 1/8 con filtro anti-aliasing (4 muestras bilineales)
+            // Pase 2A: Luminancia 1/8 (240x135 en 1080p)
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, lumaFbo[currIdx])
             GLES30.glViewport(0, 0, lumaW, lumaH)
             GLES30.glUseProgram(progLuma)
@@ -243,33 +267,68 @@ class MemcRenderer(
             GLES30.glUniform2f(uLumaSrcTexel, 1f / allocatedW, 1f / allocatedH)
             drawQuad()
 
+            // Pase 2B: Luminancia 1/16 (120x68 en 1080p) para pirámide gruesa
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, coarseLumaFbo[currIdx])
+            GLES30.glViewport(0, 0, coarseW, coarseH)
+            GLES30.glUseProgram(progDown2)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, lumaTex[currIdx])
+            GLES30.glUniform1i(uDownTex, 0)
+            GLES30.glUniform2f(uDownSrcTexel, 1f / lumaW, 1f / lumaH)
+            drawQuad()
+
             if (hasPrevFrame) {
-                // Pase 3: Flujo óptico continuo sub-píxel (Lucas-Kanade 2 iteraciones)
-                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, mvFboA)
-                GLES30.glViewport(0, 0, lumaW, lumaH)
-                GLES30.glUseProgram(progMe)
+                // Pase 3A: Flujo óptico grueso 1/16 (captura paneos rápidos hasta ±64 px en 1080p)
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, mvCoarseFbo)
+                GLES30.glViewport(0, 0, coarseW, coarseH)
+                GLES30.glUseProgram(progMeCoarse)
                 GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, lumaTex[prevIdx])
-                GLES30.glUniform1i(uMePrev, 0)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, coarseLumaTex[prevIdx])
+                GLES30.glUniform1i(uCoarsePrev, 0)
                 GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, lumaTex[currIdx])
-                GLES30.glUniform1i(uMeCurr, 1)
-                GLES30.glUniform2f(uMeTexel, 1f / lumaW, 1f / lumaH)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, coarseLumaTex[currIdx])
+                GLES30.glUniform1i(uCoarseCurr, 1)
+                GLES30.glUniform2f(uCoarseTexel, 1f / coarseW, 1f / coarseH)
                 drawQuad()
 
-                // Pase 4: Suavizado espacial de vectores (elimina los cuadritos temblando)
+                // Pase 3B: Refinamiento fino 1/8 (similar a MRecalculate de AviSynth)
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, mvFboA)
+                GLES30.glViewport(0, 0, lumaW, lumaH)
+                GLES30.glUseProgram(progMeFine)
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, lumaTex[prevIdx])
+                GLES30.glUniform1i(uFinePrev, 0)
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, lumaTex[currIdx])
+                GLES30.glUniform1i(uFineCurr, 1)
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, mvCoarseTex)
+                GLES30.glUniform1i(uFineInitMv, 2)
+                GLES30.glUniform2f(uFineTexel, 1f / lumaW, 1f / lumaH)
+                drawQuad()
+
+                // Pase 4A: Suavizado horizontal de vectores (mvTexA -> mvFboB)
                 GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, mvFboB)
                 GLES30.glViewport(0, 0, lumaW, lumaH)
-                GLES30.glUseProgram(progMvBlur)
+                GLES30.glUseProgram(progMvBlurSep)
                 GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
                 GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, mvTexA)
                 GLES30.glUniform1i(uBlurMv, 0)
-                GLES30.glUniform2f(uBlurTexel, 1f / lumaW, 1f / lumaH)
+                GLES30.glUniform2f(uBlurStep, 1.25f / lumaW, 0f)
+                drawQuad()
+
+                // Pase 4B: Suavizado vertical de vectores (mvTexB -> mvFboA)
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, mvFboA)
+                GLES30.glViewport(0, 0, lumaW, lumaH)
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, mvTexB)
+                GLES30.glUniform1i(uBlurMv, 0)
+                GLES30.glUniform2f(uBlurStep, 0f, 1.25f / lumaH)
                 drawQuad()
             }
         }
 
-        // Pase 5 (60 Hz): Warping bidireccional suave con protección de bordes y cortes
+        // Pase 5 (60 Hz): Warping bidireccional fluido directo a pantalla
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glViewport(0, 0, surfaceWidth, surfaceHeight)
 
@@ -295,7 +354,7 @@ class MemcRenderer(
         GLES30.glUniform1i(uWarpCurr, 1)
 
         GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, mvTexB)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, mvTexA)
         GLES30.glUniform1i(uWarpMv, 2)
 
         GLES30.glUniform1f(uWarpAlpha, alpha)
@@ -309,6 +368,8 @@ class MemcRenderer(
         allocatedH = h
         lumaW = max(32, w / 8)
         lumaH = max(18, h / 8)
+        coarseW = max(16, lumaW / 2)
+        coarseH = max(10, lumaH / 2)
         hasPrevFrame = false
 
         for (i in 0..1) {
@@ -319,7 +380,16 @@ class MemcRenderer(
             val l = createFboTexture(lumaW, lumaH, GLES30.GL_R8, GLES30.GL_RED)
             lumaTex[i] = l.first
             lumaFbo[i] = l.second
+
+            val c = createFboTexture(coarseW, coarseH, GLES30.GL_R8, GLES30.GL_RED)
+            coarseLumaTex[i] = c.first
+            coarseLumaFbo[i] = c.second
         }
+
+        val mC = createFboTexture(coarseW, coarseH, GLES30.GL_RGBA8, GLES30.GL_RGBA)
+        mvCoarseTex = mC.first
+        mvCoarseFbo = mC.second
+
         val mA = createFboTexture(lumaW, lumaH, GLES30.GL_RGBA8, GLES30.GL_RGBA)
         mvTexA = mA.first
         mvFboA = mA.second
@@ -353,12 +423,18 @@ class MemcRenderer(
         GLES30.glDeleteFramebuffers(2, frameFbo, 0)
         GLES30.glDeleteTextures(2, lumaTex, 0)
         GLES30.glDeleteFramebuffers(2, lumaFbo, 0)
+        GLES30.glDeleteTextures(2, coarseLumaTex, 0)
+        GLES30.glDeleteFramebuffers(2, coarseLumaFbo, 0)
+        if (mvCoarseTex != 0) GLES30.glDeleteTextures(1, intArrayOf(mvCoarseTex), 0)
+        if (mvCoarseFbo != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(mvCoarseFbo), 0)
         if (mvTexA != 0) GLES30.glDeleteTextures(1, intArrayOf(mvTexA), 0)
         if (mvFboA != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(mvFboA), 0)
         if (mvTexB != 0) GLES30.glDeleteTextures(1, intArrayOf(mvTexB), 0)
         if (mvFboB != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(mvFboB), 0)
         frameTex.fill(0); frameFbo.fill(0)
         lumaTex.fill(0); lumaFbo.fill(0)
+        coarseLumaTex.fill(0); coarseLumaFbo.fill(0)
+        mvCoarseTex = 0; mvCoarseFbo = 0
         mvTexA = 0; mvFboA = 0
         mvTexB = 0; mvFboB = 0
         allocatedW = 0; allocatedH = 0
@@ -377,10 +453,11 @@ class MemcRenderer(
             GLES30.glDeleteTextures(1, intArrayOf(extTexId), 0)
             extTexId = 0
         }
-        listOf(progPassthrough, progLuma, progMe, progMvBlur, progWarp).forEach {
+        listOf(progPassthrough, progLuma, progDown2, progMeCoarse, progMeFine, progMvBlurSep, progWarp).forEach {
             if (it != 0) GLES30.glDeleteProgram(it)
         }
-        progPassthrough = 0; progLuma = 0; progMe = 0; progMvBlur = 0; progWarp = 0
+        progPassthrough = 0; progLuma = 0; progDown2 = 0
+        progMeCoarse = 0; progMeFine = 0; progMvBlurSep = 0; progWarp = 0
         releaseSurfaceOnly()
     }
 
@@ -449,7 +526,7 @@ class MemcRenderer(
             }
         """.trimIndent()
 
-        // Downscale 1/8 con filtro de área (4 muestras bilineales = promedio de 16 píxeles)
+        // Downscale 1/8 con filtro de área (4 muestras bilineales = 16 píxeles)
         private val FS_LUMA = """
             #version 300 es
             precision mediump float;
@@ -469,11 +546,32 @@ class MemcRenderer(
             }
         """.trimIndent()
 
-        // Flujo óptico continuo Lucas-Kanade (2 iteraciones simétricas, precisión sub-píxel)
-        // MAX_DISP = 4.0 px en mapa 1/8 = ±32 px por fotograma en 1080p
-        private val FS_ME_LK = """
+        // Downscale 1/8 -> 1/16 en canal R8
+        private val FS_DOWN2_LUMA = """
             #version 300 es
             precision mediump float;
+            in vec2 vTexCoord;
+            uniform sampler2D uTex;
+            uniform vec2 uSrcTexel;
+            out vec4 fragColor;
+            void main() {
+                vec2 o1 = uSrcTexel * 0.5;
+                vec2 o2 = vec2(o1.x, -o1.y);
+                float y = 0.25 * (
+                    texture(uTex, vTexCoord + o1).r +
+                    texture(uTex, vTexCoord - o1).r +
+                    texture(uTex, vTexCoord + o2).r +
+                    texture(uTex, vTexCoord - o2).r
+                );
+                fragColor = vec4(y, 0.0, 0.0, 1.0);
+            }
+        """.trimIndent()
+
+        // Nivel 1 (1/16): Lucas-Kanade en highp (fp32) para evitar underflow en GPUs Mali/PowerVR
+        // MAX_DISP = 4.0 px en 1/16 = ±64 px en 1080p
+        private val FS_ME_COARSE = """
+            #version 300 es
+            precision highp float;
             in vec2 vTexCoord;
             uniform sampler2D uPrevLuma;
             uniform sampler2D uCurrLuma;
@@ -481,7 +579,81 @@ class MemcRenderer(
             out vec4 fragColor;
 
             const float MAX_DISP = 4.0;
-            const float REG_LAMBDA = 0.012;
+            const float REG_LAMBDA = 0.0005;
+
+            vec2 lkStep(vec2 uv, vec2 initV) {
+                float sxx = REG_LAMBDA;
+                float syy = REG_LAMBDA;
+                float sxy = 0.0;
+                float sxt = 0.0;
+                float syt = 0.0;
+
+                vec2 dx = vec2(uTexelSize.x, 0.0);
+                vec2 dy = vec2(0.0, uTexelSize.y);
+                vec2 halfShift = initV * 0.5 * uTexelSize;
+
+                for (int j = -1; j <= 1; j++) {
+                    for (int i = -1; i <= 1; i++) {
+                        vec2 off = vec2(float(i), float(j)) * uTexelSize * 1.25;
+                        vec2 uvP = uv + off - halfShift;
+                        vec2 uvC = uv + off + halfShift;
+
+                        float p0 = texture(uPrevLuma, uvP).r;
+                        float c0 = texture(uCurrLuma, uvC).r;
+                        float it = c0 - p0;
+
+                        float ix = 0.25 * (
+                            (texture(uPrevLuma, uvP + dx).r - texture(uPrevLuma, uvP - dx).r) +
+                            (texture(uCurrLuma, uvC + dx).r - texture(uCurrLuma, uvC - dx).r)
+                        );
+                        float iy = 0.25 * (
+                            (texture(uPrevLuma, uvP + dy).r - texture(uPrevLuma, uvP - dy).r) +
+                            (texture(uCurrLuma, uvC + dy).r - texture(uCurrLuma, uvC - dy).r)
+                        );
+
+                        sxx += ix * ix;
+                        syy += iy * iy;
+                        sxy += ix * iy;
+                        sxt += ix * it;
+                        syt += iy * it;
+                    }
+                }
+
+                float det = sxx * syy - sxy * sxy;
+                if (det < 1e-8) return vec2(0.0);
+
+                vec2 dv = vec2(
+                    -(syy * sxt - sxy * syt),
+                    -(sxx * syt - sxy * sxt)
+                ) / det;
+
+                return clamp(dv, vec2(-2.0), vec2(2.0));
+            }
+
+            void main() {
+                vec2 v = lkStep(vTexCoord, vec2(0.0));
+                v = clamp(v + lkStep(vTexCoord, v), vec2(-MAX_DISP), vec2(MAX_DISP));
+                v = clamp(v + lkStep(vTexCoord, v), vec2(-MAX_DISP), vec2(MAX_DISP));
+
+                vec2 encoded = floor((v / MAX_DISP) * 127.0 + 128.5) / 255.0;
+                fragColor = vec4(encoded, 1.0, 1.0);
+            }
+        """.trimIndent()
+
+        // Nivel 2 (1/8): Refinamiento fino en highp partiendo del vector grueso (x2)
+        // MAX_DISP = 8.0 px en 1/8 = ±64 px en 1080p
+        private val FS_ME_FINE = """
+            #version 300 es
+            precision highp float;
+            in vec2 vTexCoord;
+            uniform sampler2D uPrevLuma;
+            uniform sampler2D uCurrLuma;
+            uniform sampler2D uCoarseMv;
+            uniform vec2 uTexelSize;
+            out vec4 fragColor;
+
+            const float MAX_DISP = 8.0;
+            const float REG_LAMBDA = 0.0005;
 
             vec2 lkStep(vec2 uv, vec2 initV, out float avgErr) {
                 float sxx = REG_LAMBDA;
@@ -497,7 +669,7 @@ class MemcRenderer(
 
                 for (int j = -1; j <= 1; j++) {
                     for (int i = -1; i <= 1; i++) {
-                        vec2 off = vec2(float(i), float(j)) * uTexelSize * 1.5;
+                        vec2 off = vec2(float(i), float(j)) * uTexelSize * 1.25;
                         vec2 uvP = uv + off - halfShift;
                         vec2 uvC = uv + off + halfShift;
 
@@ -525,80 +697,75 @@ class MemcRenderer(
 
                 avgErr = errSum / 9.0;
                 float det = sxx * syy - sxy * sxy;
-                if (det < 1e-6) return vec2(0.0);
+                if (det < 1e-8) return vec2(0.0);
 
                 vec2 dv = vec2(
                     -(syy * sxt - sxy * syt),
                     -(sxx * syt - sxy * sxt)
                 ) / det;
 
-                return clamp(dv, vec2(-2.5), vec2(2.5));
+                return clamp(dv, vec2(-2.0), vec2(2.0));
             }
 
             void main() {
+                vec2 cRaw = texture(uCoarseMv, vTexCoord).rg;
+                vec2 v = ((cRaw * 255.0) - 128.0) / 127.0 * MAX_DISP;
+
                 float err1 = 0.0;
-                vec2 v = lkStep(vTexCoord, vec2(0.0), err1);
+                v = clamp(v + lkStep(vTexCoord, v, err1), vec2(-MAX_DISP), vec2(MAX_DISP));
 
-                // Segunda iteración de refinamiento si hay movimiento apreciable
                 float finalErr = err1;
-                if (length(v) > 0.15) {
-                    vec2 dv = lkStep(vTexCoord, v, finalErr);
-                    v = clamp(v + dv, vec2(-MAX_DISP), vec2(MAX_DISP));
-                }
+                v = clamp(v + lkStep(vTexCoord, v, finalErr), vec2(-MAX_DISP), vec2(MAX_DISP));
 
-                // Confianza: cae a 0 en cortes de escena o ruido fuerte
-                float conf = 1.0 - smoothstep(0.07, 0.19, finalErr);
+                // Confianza amplia: solo cae a 0 en cortes bruscos de escena
+                float conf = 1.0 - smoothstep(0.16, 0.36, finalErr);
 
-                // Codificación con cero exacto en 128/255 (sin micro-temblor en fondos quietos)
                 vec2 encoded = floor((v / MAX_DISP) * 127.0 + 128.5) / 255.0;
                 fragColor = vec4(encoded, conf, 1.0);
             }
         """.trimIndent()
 
-        // Suavizado espacial 5x5 sobre el mapa de vectores (cohesión de bloques)
-        private val FS_MV_BLUR = """
+        // Suavizado separable de 5 taps (cohesión fluida tipo TV MEMC, sin cuadritos)
+        private val FS_MV_BLUR_SEP = """
             #version 300 es
             precision mediump float;
             in vec2 vTexCoord;
             uniform sampler2D uMvTex;
-            uniform vec2 uTexelSize;
+            uniform vec2 uStep;
             out vec4 fragColor;
 
-            const float MAX_DISP = 4.0;
+            const float MAX_DISP = 8.0;
 
             void main() {
+                float weights[5];
+                weights[0] = 0.12;
+                weights[1] = 0.22;
+                weights[2] = 0.32;
+                weights[3] = 0.22;
+                weights[4] = 0.12;
+
                 vec2 sumV = vec2(0.0);
                 float sumC = 0.0;
-                float sumW = 0.0;
 
-                for (int j = -1; j <= 1; j++) {
-                    for (int i = -1; i <= 1; i++) {
-                        vec2 off = vec2(float(i), float(j)) * uTexelSize * 1.5;
-                        vec3 s = texture(uMvTex, vTexCoord + off).rgb;
-                        vec2 v = ((s.rg * 255.0) - 128.0) / 127.0 * MAX_DISP;
-                        float c = s.b;
-                        float w = (i == 0 && j == 0) ? 2.0 : 1.0;
-
-                        sumV += v * (c * w);
-                        sumC += c * w;
-                        sumW += w;
-                    }
+                for (int k = -2; k <= 2; k++) {
+                    vec3 s = texture(uMvTex, vTexCoord + uStep * float(k)).rgb;
+                    vec2 v = ((s.rg * 255.0) - 128.0) / 127.0 * MAX_DISP;
+                    float w = weights[k + 2];
+                    sumV += v * (s.b * w);
+                    sumC += s.b * w;
                 }
 
                 vec2 avgV = (sumC > 0.001) ? (sumV / sumC) : vec2(0.0);
-                float avgC = sumC / sumW;
-
-                // Zona muerta para mantener fondos quietos 100% estables
-                if (length(avgV) < 0.08) {
+                if (length(avgV) < 0.04) {
                     avgV = vec2(0.0);
                 }
 
                 vec2 encoded = floor((avgV / MAX_DISP) * 127.0 + 128.5) / 255.0;
-                fragColor = vec4(encoded, avgC, 1.0);
+                fragColor = vec4(encoded, sumC, 1.0);
             }
         """.trimIndent()
 
-        // Warping bidireccional suave con chequeo de oclusión por píxel
+        // Warping bidireccional fluido a 60 Hz
         private val FS_WARP = """
             #version 300 es
             precision mediump float;
@@ -610,7 +777,7 @@ class MemcRenderer(
             uniform vec2 uLumaSize;
             out vec4 fragColor;
 
-            const float MAX_DISP = 4.0;
+            const float MAX_DISP = 8.0;
 
             void main() {
                 vec3 mvData = texture(uMvTex, vTexCoord).rgb;
@@ -626,10 +793,9 @@ class MemcRenderer(
                 vec3 currCol = texture(uCurrTex, uvCurr).rgb;
                 vec3 warped = mix(prevCol, currCol, uAlpha);
 
-                // Verificación de oclusión: si los píxeles deformados no coinciden,
-                // evita halos o rasgaduras en bordes de objetos rápidos
+                // Protección relajada: mantiene fluidez en movimiento y evita halos solo en oclusiones fuertes
                 float lumaDiff = abs(dot(prevCol - currCol, vec3(0.299, 0.587, 0.114)));
-                float matchConf = 1.0 - smoothstep(0.10, 0.28, lumaDiff);
+                float matchConf = 1.0 - smoothstep(0.24, 0.48, lumaDiff);
                 float finalConf = conf * matchConf;
 
                 vec3 fallback = (uAlpha < 0.5)
