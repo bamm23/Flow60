@@ -5,6 +5,8 @@ import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -15,7 +17,6 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
@@ -49,18 +50,20 @@ class PlayerActivity : Activity() {
     private lateinit var surfaceView: MemcGLSurfaceView
     private lateinit var subtitleView: SubtitleView
     private lateinit var tvStatus: TextView
+    private lateinit var tvQuickFeedback: TextView
     private lateinit var osdContainer: LinearLayout
     private lateinit var tvTime: TextView
     private lateinit var progressBar: ProgressBar
+
     private lateinit var btnPlayPause: Button
     private lateinit var btnAudio: Button
     private lateinit var btnSubtitles: Button
     private lateinit var btnAspect: Button
-
-    // Controles opcionales o dinámicos para subtítulos y MEMC 60 FPS
-    private var btnSubStyle: Button? = null
-    private var btnReloadSubs: Button? = null
-    private var btnMemc: Button? = null
+    private lateinit var btnMemc: Button
+    private lateinit var btnImage: Button
+    private lateinit var btnSubSize: Button
+    private lateinit var btnSubBg: Button
+    private lateinit var btnReloadSubs: Button
 
     private val handler = Handler(Looper.getMainLooper())
     private var lastKnownPositionMs: Long = 0L
@@ -71,26 +74,44 @@ class PlayerActivity : Activity() {
     private var currentVideoWidth = 0
     private var currentVideoHeight = 0
 
+    // Control de búsqueda progresiva (toque corto 10s, toque continuo más rápido)
+    private var isHoldingSeek = false
+    private var pendingSeekMs = 0L
+    private var totalSeekDeltaMs = 0L
+
     // Estado de interpolación MEMC y control térmico
     private var userWantsMemc = true
     private var memcBypassReason: String? = null
     private var thermalTickCounter = 0
+
+    // Ajustes editables de post-procesado de imagen (Nitidez CAS, Contraste, Saturación)
+    private val sharpValues = floatArrayOf(0.0f, 0.25f, 0.50f, 0.80f)
+    private val sharpLabels = arrayOf("OFF", "Baja", "Media", "Alta")
+    private var sharpIndex = 0
+
+    private val contrastValues = floatArrayOf(1.0f, 1.06f, 1.12f, 1.18f, 0.94f)
+    private val contrastLabels = arrayOf("Original", "+6%", "+12%", "+18%", "-6%")
+    private var contrastIndex = 0
+
+    private val satValues = floatArrayOf(1.0f, 1.08f, 1.16f, 1.25f, 0.90f)
+    private val satLabels = arrayOf("Original", "+8%", "+16%", "+25%", "-10%")
+    private var satIndex = 0
 
     // Lista en memoria de subtítulos externos (Intent + Addons de Stremio)
     private val loadedExternalSubs = mutableListOf<MediaItem.SubtitleConfiguration>()
 
     // Preferencias de apariencia de subtítulos
     private val subSizeValues = floatArrayOf(18f, 22f, 26f, 32f, 38f)
-    private val subSizeLabels = arrayOf("Pequeño", "Normal", "Grande", "Extra Grande", "Gigante")
-    private var subSizeIndex = 2 // Por defecto: Grande (26sp)
+    private val subSizePercentLabels = arrayOf("80%", "100%", "120%", "145%", "170%")
+    private var subSizeIndex = 2 // Por defecto: 120% (26sp)
 
     private val subBgValues = intArrayOf(
         Color.TRANSPARENT,
-        Color.parseColor("#66000000"),
-        Color.parseColor("#AA000000"),
-        Color.BLACK
+        Color.argb(102, 0, 0, 0), // 40%
+        Color.argb(166, 0, 0, 0), // 65%
+        Color.BLACK               // 100%
     )
-    private val subBgLabels = arrayOf("Transparente (Borde)", "Semitransparente 40%", "Oscuro 65%", "Negro Sólido")
+    private val subBgPercentLabels = arrayOf("0%", "40%", "65%", "100%")
     private var subBgIndex = 0
 
     private val progressRunnable = object : Runnable {
@@ -123,6 +144,10 @@ class PlayerActivity : Activity() {
         osdContainer.visibility = View.GONE
     }
 
+    private val hideFeedbackRunnable = Runnable {
+        tvQuickFeedback.visibility = View.GONE
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -131,34 +156,46 @@ class PlayerActivity : Activity() {
         surfaceView = findViewById(R.id.surfaceView)
         subtitleView = findViewById(R.id.subtitleView)
         tvStatus = findViewById(R.id.tvStatus)
+        tvQuickFeedback = findViewById(R.id.tvQuickFeedback)
         osdContainer = findViewById(R.id.osdContainer)
         tvTime = findViewById(R.id.tvTime)
         progressBar = findViewById(R.id.progressBar)
+
         btnPlayPause = findViewById(R.id.btnPlayPause)
         btnAudio = findViewById(R.id.btnAudio)
         btnSubtitles = findViewById(R.id.btnSubtitles)
         btnAspect = findViewById(R.id.btnAspect)
+        btnMemc = findViewById(R.id.btnMemc)
+        btnImage = findViewById(R.id.btnImage)
+        btnSubSize = findViewById(R.id.btnSubSize)
+        btnSubBg = findViewById(R.id.btnSubBg)
+        btnReloadSubs = findViewById(R.id.btnReloadSubs)
 
-        // Cargar preferencias guardadas de subtítulos y MEMC
+        // Estilizado visual limpio para TV (esquinas redondeadas y foco destacado)
+        styleUiElements()
+
+        // Cargar preferencias guardadas
         val prefs = getSharedPreferences("player_prefs", Context.MODE_PRIVATE)
         subSizeIndex = prefs.getInt("sub_size_index", 2).coerceIn(0, subSizeValues.lastIndex)
         subBgIndex = prefs.getInt("sub_bg_index", 0).coerceIn(0, subBgValues.lastIndex)
         userWantsMemc = prefs.getBoolean("memc_enabled", true)
+        sharpIndex = prefs.getInt("img_sharp_idx", 0).coerceIn(0, sharpValues.lastIndex)
+        contrastIndex = prefs.getInt("img_contrast_idx", 0).coerceIn(0, contrastValues.lastIndex)
+        satIndex = prefs.getInt("img_sat_idx", 0).coerceIn(0, satValues.lastIndex)
+
         applySubtitleStyle()
+        applyImageEnhancements()
+        applyMemcState()
 
         // Vincular el Surface OpenGL con ExoPlayer cuando el contexto EGL esté listo
         surfaceView.setOnSurfaceReadyListener { surface ->
             player?.setVideoSurface(surface)
         }
 
-        // Vincular o inyectar botones adicionales en la barra de controles sin requerir cambios obligatorios en XML
-        setupExtraButtons()
-
+        // Eventos de botones
         btnPlayPause.setOnClickListener {
-            player?.let { exo ->
-                if (exo.isPlaying) exo.pause() else exo.play()
-                resetOsdTimer()
-            }
+            togglePlayPause(showFeedback = false)
+            resetOsdTimer()
         }
         btnAudio.setOnClickListener {
             showTrackDialog(C.TRACK_TYPE_AUDIO, "Seleccionar Audio")
@@ -168,78 +205,14 @@ class PlayerActivity : Activity() {
         }
         btnAspect.setOnClickListener {
             isVerticalStretch = !isVerticalStretch
-            btnAspect.text = if (isVerticalStretch) "Modo: Estirado 16:9" else "Modo: Original"
+            btnAspect.text = if (isVerticalStretch) "⛶ 16:9" else "⛶ Original"
             applyAspectRatio()
             resetOsdTimer()
         }
-
-        handleIntent(intent)
-    }
-
-    private fun setupExtraButtons() {
-        val buttonRow = btnSubtitles.parent as? LinearLayout ?: return
-
-        // Intentar encontrar si el usuario ya los definió en activity_player.xml por ID dinámico
-        val idSubStyle = resources.getIdentifier("btnSubStyle", "id", packageName)
-        val idReloadSubs = resources.getIdentifier("btnReloadSubs", "id", packageName)
-        val idMemc = resources.getIdentifier("btnMemc", "id", packageName)
-
-        btnSubStyle = if (idSubStyle != 0) findViewById(idSubStyle) else null
-        btnReloadSubs = if (idReloadSubs != 0) findViewById(idReloadSubs) else null
-        btnMemc = if (idMemc != 0) findViewById(idMemc) else null
-
-        val marginPx = TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_DIP, 12f, resources.displayMetrics
-        ).toInt()
-
-        if (btnSubStyle == null) {
-            btnSubStyle = Button(this).apply {
-                text = "Estilo Sub"
-                isFocusable = true
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { marginStart = marginPx }
-            }
-            buttonRow.addView(btnSubStyle)
-        }
-
-        if (btnReloadSubs == null) {
-            btnReloadSubs = Button(this).apply {
-                text = "Recargar subtítulos"
-                isFocusable = true
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { marginStart = marginPx }
-            }
-            buttonRow.addView(btnReloadSubs)
-        }
-
-        if (btnMemc == null) {
-            btnMemc = Button(this).apply {
-                isFocusable = true
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { marginStart = marginPx }
-            }
-            buttonRow.addView(btnMemc)
-        }
-
-        btnSubStyle?.setOnClickListener {
-            showSubtitleAppearanceDialog()
-        }
-
-        btnReloadSubs?.setOnClickListener {
-            fetchSubtitlesFromStremioAddons(isManualReload = true)
-            resetOsdTimer()
-        }
-
-        btnMemc?.setOnClickListener {
+        btnMemc.setOnClickListener {
             if (memcBypassReason != null) {
                 Toast.makeText(
-                    this@PlayerActivity,
+                    this,
                     "60 FPS desactivado automáticamente ($memcBypassReason)",
                     Toast.LENGTH_LONG
                 ).show()
@@ -254,8 +227,89 @@ class PlayerActivity : Activity() {
             applyMemcState()
             resetOsdTimer()
         }
+        btnImage.setOnClickListener {
+            showImageSettingsDialog()
+            resetOsdTimer()
+        }
+        btnSubSize.setOnClickListener {
+            subSizeIndex = (subSizeIndex + 1) % subSizeValues.size
+            getSharedPreferences("player_prefs", Context.MODE_PRIVATE)
+                .edit()
+                .putInt("sub_size_index", subSizeIndex)
+                .apply()
+            applySubtitleStyle()
+            resetOsdTimer()
+        }
+        btnSubBg.setOnClickListener {
+            subBgIndex = (subBgIndex + 1) % subBgValues.size
+            getSharedPreferences("player_prefs", Context.MODE_PRIVATE)
+                .edit()
+                .putInt("sub_bg_index", subBgIndex)
+                .apply()
+            applySubtitleStyle()
+            resetOsdTimer()
+        }
+        btnReloadSubs.setOnClickListener {
+            fetchSubtitlesFromStremioAddons(isManualReload = true)
+            resetOsdTimer()
+        }
 
-        applyMemcState()
+        handleIntent(intent)
+    }
+
+    private fun styleUiElements() {
+        val density = resources.displayMetrics.density
+        val radius = 10f * density
+        val padH = (14 * density).toInt()
+
+        // Fondo degradado oscuro para el OSD inferior
+        osdContainer.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(Color.argb(180, 10, 10, 14), Color.argb(242, 8, 8, 12))
+        )
+
+        // Fondo redondeado para el indicador rápido flotante
+        tvQuickFeedback.background = GradientDrawable().apply {
+            setColor(Color.argb(215, 16, 16, 22))
+            cornerRadius = 24f * density
+            setStroke((1.5f * density).toInt(), Color.argb(90, 255, 255, 255))
+        }
+
+        val allButtons = listOf(
+            btnPlayPause, btnAudio, btnSubtitles, btnAspect, btnMemc, btnImage,
+            btnSubSize, btnSubBg, btnReloadSubs
+        )
+
+        for (btn in allButtons) {
+            val focusedDrawable = GradientDrawable().apply {
+                setColor(Color.parseColor("#FF9800"))
+                cornerRadius = radius
+                setStroke((2f * density).toInt(), Color.WHITE)
+            }
+            val normalDrawable = GradientDrawable().apply {
+                setColor(Color.argb(65, 255, 255, 255))
+                cornerRadius = radius
+                setStroke((1f * density).toInt(), Color.argb(85, 255, 255, 255))
+            }
+
+            val selector = StateListDrawable().apply {
+                addState(intArrayOf(android.R.attr.state_focused), focusedDrawable)
+                addState(intArrayOf(android.R.attr.state_pressed), focusedDrawable)
+                addState(intArrayOf(), normalDrawable)
+            }
+
+            btn.background = selector
+            btn.setTextColor(Color.WHITE)
+            btn.setPadding(padH, 0, padH, 0)
+            btn.setOnFocusChangeListener { v, hasFocus ->
+                val b = v as Button
+                b.setTextColor(if (hasFocus) Color.BLACK else Color.WHITE)
+                v.animate().scaleX(if (hasFocus) 1.06f else 1.0f)
+                    .scaleY(if (hasFocus) 1.06f else 1.0f)
+                    .setDuration(100)
+                    .start()
+            }
+        }
     }
 
     private fun applySubtitleStyle() {
@@ -266,6 +320,9 @@ class PlayerActivity : Activity() {
             CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW
         }
 
+        // Desactivar estilos embebidos para que el tamaño y la opacidad elegidos SIEMPRE se apliquen
+        subtitleView.setApplyEmbeddedStyles(false)
+        subtitleView.setApplyEmbeddedFontSizes(false)
         subtitleView.setStyle(
             CaptionStyleCompat(
                 Color.WHITE,
@@ -277,31 +334,88 @@ class PlayerActivity : Activity() {
             )
         )
         subtitleView.setFixedTextSize(TypedValue.COMPLEX_UNIT_SP, subSizeValues[subSizeIndex])
+        subtitleView.invalidate()
+
+        btnSubSize.text = "Aa ${subSizePercentLabels[subSizeIndex]}"
+        btnSubBg.text = "◫ Fondo: ${subBgPercentLabels[subBgIndex]}"
     }
 
-    private fun showSubtitleAppearanceDialog() {
+    private fun applyImageEnhancements() {
+        surfaceView.setImageEnhancements(
+            sharpValues[sharpIndex],
+            contrastValues[contrastIndex],
+            satValues[satIndex]
+        )
+        val hasCustom = sharpIndex != 0 || contrastIndex != 0 || satIndex != 0
+        btnImage.text = if (hasCustom) "🎨 Imagen *" else "🎨 Imagen"
+    }
+
+    private fun showImageSettingsDialog() {
         val options = arrayOf(
-            "Tamaño: ${subSizeLabels[subSizeIndex]} (Cambiar)",
-            "Fondo: ${subBgLabels[subBgIndex]} (Cambiar)"
+            "Nitidez (CAS): ${sharpLabels[sharpIndex]}  [Cambiar]",
+            "Contraste: ${contrastLabels[contrastIndex]}  [Cambiar]",
+            "Color / Saturación: ${satLabels[satIndex]}  [Cambiar]",
+            "Restablecer todo a Original"
         )
 
         AlertDialog.Builder(this)
-            .setTitle("Apariencia de Subtítulos")
+            .setTitle("Ajustes de Imagen (En vivo)")
             .setItems(options) { _, which ->
-                val prefs = getSharedPreferences("player_prefs", Context.MODE_PRIVATE).edit()
-                if (which == 0) {
-                    subSizeIndex = (subSizeIndex + 1) % subSizeValues.size
-                    prefs.putInt("sub_size_index", subSizeIndex).apply()
-                    Toast.makeText(this, "Tamaño: ${subSizeLabels[subSizeIndex]}", Toast.LENGTH_SHORT).show()
-                } else {
-                    subBgIndex = (subBgIndex + 1) % subBgValues.size
-                    prefs.putInt("sub_bg_index", subBgIndex).apply()
-                    Toast.makeText(this, "Fondo: ${subBgLabels[subBgIndex]}", Toast.LENGTH_SHORT).show()
+                val editor = getSharedPreferences("player_prefs", Context.MODE_PRIVATE).edit()
+                when (which) {
+                    0 -> {
+                        sharpIndex = (sharpIndex + 1) % sharpValues.size
+                        editor.putInt("img_sharp_idx", sharpIndex).apply()
+                    }
+                    1 -> {
+                        contrastIndex = (contrastIndex + 1) % contrastValues.size
+                        editor.putInt("img_contrast_idx", contrastIndex).apply()
+                    }
+                    2 -> {
+                        satIndex = (satIndex + 1) % satValues.size
+                        editor.putInt("img_sat_idx", satIndex).apply()
+                    }
+                    3 -> {
+                        sharpIndex = 0
+                        contrastIndex = 0
+                        satIndex = 0
+                        editor.putInt("img_sharp_idx", 0)
+                            .putInt("img_contrast_idx", 0)
+                            .putInt("img_sat_idx", 0)
+                            .apply()
+                    }
                 }
-                applySubtitleStyle()
+                applyImageEnhancements()
                 resetOsdTimer()
+                // Reabrir el diálogo para seguir ajustando cómodamente sin cerrar
+                if (which != 3) {
+                    showImageSettingsDialog()
+                } else {
+                    Toast.makeText(this, "Imagen restablecida a Original", Toast.LENGTH_SHORT).show()
+                }
             }
+            .setNegativeButton("Cerrar") { _, _ -> resetOsdTimer() }
             .show()
+    }
+
+    private fun togglePlayPause(showFeedback: Boolean) {
+        val exo = player ?: return
+        if (exo.isPlaying) {
+            exo.pause()
+            btnPlayPause.text = "▶"
+            if (showFeedback) showQuickFeedback("⏸ Pausado")
+        } else {
+            exo.play()
+            btnPlayPause.text = "⏸"
+            if (showFeedback) showQuickFeedback("▶ Reproduciendo")
+        }
+    }
+
+    private fun showQuickFeedback(text: String, durationMs: Long = 1300L) {
+        tvQuickFeedback.text = text
+        tvQuickFeedback.visibility = View.VISIBLE
+        handler.removeCallbacks(hideFeedbackRunnable)
+        handler.postDelayed(hideFeedbackRunnable, durationMs)
     }
 
     override fun onNewIntent(intent: Intent?) {
@@ -333,8 +447,6 @@ class PlayerActivity : Activity() {
 
         initPlayer(videoUri, loadedExternalSubs)
 
-        // Si Stremio no adjuntó subtítulos en el Intent (comportamiento normal en Android TV),
-        // los buscamos automáticamente desde los addons de Stremio en segundo plano
         if (loadedExternalSubs.isEmpty()) {
             fetchSubtitlesFromStremioAddons(isManualReload = false)
         }
@@ -343,7 +455,6 @@ class PlayerActivity : Activity() {
     private fun fetchSubtitlesFromStremioAddons(isManualReload: Boolean) {
         val uri = currentVideoUri ?: return
 
-        // Primero revisamos si el Intent traía algo nuevo en caso de recarga manual
         val intentSubs = extractExternalSubtitles(intent)
         if (intentSubs.isNotEmpty() && loadedExternalSubs.isEmpty()) {
             loadedExternalSubs.addAll(intentSubs)
@@ -428,21 +539,14 @@ class PlayerActivity : Activity() {
     private fun initPlayer(videoUri: Uri, subs: List<MediaItem.SubtitleConfiguration>) {
         releasePlayer()
 
-        // 1. Control estricto de RAM: máximo 14 MB de búfer y 0 back-buffer
         val loadControl = DefaultLoadControl.Builder()
             .setAllocator(DefaultAllocator(true, C.DEFAULT_BUFFER_SEGMENT_SIZE))
-            .setBufferDurationsMs(
-                4_000,  // minBufferMs
-                12_000, // maxBufferMs
-                1_500,  // bufferForPlaybackMs
-                3_000   // bufferForPlaybackAfterRebufferMs
-            )
+            .setBufferDurationsMs(4_000, 12_000, 1_500, 3_000)
             .setTargetBufferBytes(14 * 1024 * 1024)
             .setPrioritizeTimeOverSizeThresholds(false)
             .setBackBuffer(0, false)
             .build()
 
-        // 2. Tolerancia alta a microcortes del motor de torrents local de Stremio
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(25_000)
@@ -459,7 +563,6 @@ class PlayerActivity : Activity() {
         val renderersFactory = DefaultRenderersFactory(this)
             .setEnableDecoderFallback(true)
 
-        // Reiniciar estado de fotogramas previos al cambiar de episodio/video
         surfaceView.resetFrames()
         memcBypassReason = null
         thermalTickCounter = 0
@@ -486,6 +589,7 @@ class PlayerActivity : Activity() {
 
         checkThermalStatus()
         applyMemcState()
+        applyImageEnhancements()
         handler.post(progressRunnable)
     }
 
@@ -508,6 +612,7 @@ class PlayerActivity : Activity() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             surfaceView.setPlaying(isPlaying)
+            btnPlayPause.text = if (isPlaying) "⏸" else "▶"
         }
 
         override fun onPositionDiscontinuity(
@@ -598,22 +703,20 @@ class PlayerActivity : Activity() {
     private fun applyMemcState() {
         val active = userWantsMemc && memcBypassReason == null
         surfaceView.setMemcEnabled(active)
-        btnMemc?.text = when {
-            memcBypassReason != null -> "60 FPS: Auto-OFF"
-            active -> "60 FPS: ON"
-            else -> "60 FPS: OFF"
+        btnMemc.text = when {
+            memcBypassReason != null -> "⚡ 60 FPS: Auto-OFF"
+            active -> "⚡ 60 FPS: ON"
+            else -> "⚡ 60 FPS: OFF"
         }
     }
 
     private fun applyAspectRatio() {
         val params = surfaceView.layoutParams as FrameLayout.LayoutParams
         if (isVerticalStretch || currentVideoWidth == 0 || currentVideoHeight == 0) {
-            // Estira verticalmente al 100% de la pantalla sin recortar los laterales
             params.width = FrameLayout.LayoutParams.MATCH_PARENT
             params.height = FrameLayout.LayoutParams.MATCH_PARENT
             params.gravity = Gravity.CENTER
         } else {
-            // Modo proporción original si el usuario desea alternar
             val screenWidth = resources.displayMetrics.widthPixels
             val screenHeight = resources.displayMetrics.heightPixels
             val videoRatio = currentVideoWidth.toFloat() / currentVideoHeight.toFloat()
@@ -643,13 +746,9 @@ class PlayerActivity : Activity() {
                     .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
                     .build()
             }
-            labels.add("🔄 Buscar / Recargar subtítulos de Addons (Stremio)")
+            labels.add("↻ Buscar / Recargar subtítulos de Addons (Stremio)")
             actions.add {
                 fetchSubtitlesFromStremioAddons(isManualReload = true)
-            }
-            labels.add("🎨 Ajustar tamaño y fondo de subtítulos")
-            actions.add {
-                showSubtitleAppearanceDialog()
             }
         }
 
@@ -700,37 +799,54 @@ class PlayerActivity : Activity() {
         when (keyCode) {
             KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                 if (!isOsdVisible) {
-                    showOsd()
+                    if (event == null || event.repeatCount == 0) {
+                        togglePlayPause(showFeedback = true)
+                    }
                     return true
                 }
             }
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                if (exo.isPlaying) exo.pause() else exo.play()
-                showOsd()
+                if (event == null || event.repeatCount == 0) {
+                    togglePlayPause(showFeedback = !isOsdVisible)
+                }
+                if (isOsdVisible) resetOsdTimer()
                 return true
             }
-            KeyEvent.KEYCODE_DPAD_LEFT -> {
+            KeyEvent.KEYCODE_DPAD_DOWN -> {
                 if (!isOsdVisible) {
-                    val target = (exo.currentPosition - 15_000).coerceAtLeast(0L)
-                    exo.seekTo(target)
-                    lastKnownPositionMs = target
                     showOsd()
                     return true
                 }
             }
-            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
                 if (!isOsdVisible) {
+                    val direction = if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) 1L else -1L
+                    val repeat = event?.repeatCount ?: 0
                     val dur = exo.duration
-                    val target = if (dur > 0) (exo.currentPosition + 15_000).coerceAtMost(dur) else exo.currentPosition + 15_000
-                    exo.seekTo(target)
-                    lastKnownPositionMs = target
-                    showOsd()
-                    return true
-                }
-            }
-            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
-                if (!isOsdVisible) {
-                    showOsd()
+
+                    if (repeat == 0) {
+                        isHoldingSeek = true
+                        pendingSeekMs = exo.currentPosition
+                        totalSeekDeltaMs = 0L
+                    }
+
+                    // Toque corto = 10s; toque continuo = acelera progresivamente (15s -> 30s -> 60s)
+                    val stepMs = when {
+                        repeat == 0 -> 10_000L
+                        repeat <= 4 -> 15_000L
+                        repeat <= 12 -> 30_000L
+                        else -> 60_000L
+                    }
+
+                    val nextPos = pendingSeekMs + direction * stepMs
+                    pendingSeekMs = if (dur > 0) nextPos.coerceIn(0L, dur) else nextPos.coerceAtLeast(0L)
+                    totalSeekDeltaMs += direction * stepMs
+
+                    val arrow = if (direction > 0) "⏩" else "⏪"
+                    val sign = if (totalSeekDeltaMs >= 0) "+" else "-"
+                    val absSec = kotlin.math.abs(totalSeekDeltaMs) / 1000L
+                    val durText = if (dur > 0) " / ${formatTime(dur)}" else ""
+                    showQuickFeedback("$arrow ${sign}${absSec}s  •  ${formatTime(pendingSeekMs)}$durText", 1800L)
                     return true
                 }
             }
@@ -755,6 +871,19 @@ class PlayerActivity : Activity() {
         return super.onKeyDown(keyCode, event)
     }
 
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (isHoldingSeek && (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)) {
+            isHoldingSeek = false
+            player?.let { exo ->
+                surfaceView.resetFrames()
+                exo.seekTo(pendingSeekMs)
+                lastKnownPositionMs = pendingSeekMs
+            }
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
     private fun showOsd() {
         val exo = player ?: return
         val pos = exo.currentPosition
@@ -763,6 +892,7 @@ class PlayerActivity : Activity() {
             tvTime.text = "${formatTime(pos)} / ${formatTime(dur)}"
             progressBar.progress = ((pos * 1000) / dur).toInt()
         }
+        btnPlayPause.text = if (exo.isPlaying) "⏸" else "▶"
         osdContainer.visibility = View.VISIBLE
         btnPlayPause.requestFocus()
         resetOsdTimer()
@@ -792,6 +922,7 @@ class PlayerActivity : Activity() {
 
     private fun releasePlayer() {
         handler.removeCallbacks(progressRunnable)
+        handler.removeCallbacks(hideFeedbackRunnable)
         player?.let {
             if (it.currentPosition > 0) savePosition(it.currentPosition)
             it.clearVideoSurface()
