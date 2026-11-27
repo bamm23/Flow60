@@ -5,12 +5,12 @@
     android:background="#000000"
     android:keepScreenOn="true">
 
-    <!-- SurfaceView al 100% de ancho y alto: estira verticalmente sin recortar los lados -->
-   <com.lite.stremioplayer.MemcGLSurfaceView
-    android:id="@+id/surfaceView"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:layout_gravity="center" />
+    <!-- Vista OpenGL ES 3.0 para MEMC 60 FPS + Post-procesado + Estirado 16:9 -->
+    <com.lite.stremioplayer.MemcGLSurfaceView
+        android:id="@+id/surfaceView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
 
     <!-- Capa ligera exclusivamente para subtítulos -->
     <androidx.media3.ui.SubtitleView
@@ -25,22 +25,45 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="center"
-        android:background="#AA000000"
-        android:padding="16dp"
+        android:background="#CC000000"
+        android:paddingStart="22dp"
+        android:paddingTop="14dp"
+        android:paddingEnd="22dp"
+        android:paddingBottom="14dp"
         android:text="Cargando..."
         android:textColor="#FFFFFF"
         android:textSize="18sp"
         android:visibility="gone" />
 
-    <!-- Panel OSD minimalista para Control Remoto (D-Pad) -->
+    <!-- Indicador rápido flotante para Pausa/Play o Adelantar/Retroceder sin abrir el OSD -->
+    <TextView
+        android:id="@+id/tvQuickFeedback"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="36dp"
+        android:background="#CC000000"
+        android:paddingStart="24dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="24dp"
+        android:paddingBottom="10dp"
+        android:textColor="#FFFFFF"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
+
+    <!-- Panel OSD minimalista para Control Remoto (se abre solo con flecha ABAJO) -->
     <LinearLayout
         android:id="@+id/osdContainer"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
-        android:background="#CC000000"
+        android:background="#D9000000"
         android:orientation="vertical"
-        android:padding="20dp"
+        android:paddingStart="24dp"
+        android:paddingTop="18dp"
+        android:paddingEnd="24dp"
+        android:paddingBottom="20dp"
         android:visibility="gone">
 
         <TextView
@@ -49,83 +72,123 @@
             android:layout_height="wrap_content"
             android:text="00:00:00 / 00:00:00"
             android:textColor="#FFFFFF"
-            android:textSize="16sp" />
+            android:textSize="16sp"
+            android:textStyle="bold" />
 
         <ProgressBar
             android:id="@+id/progressBar"
             style="?android:attr/progressBarStyleHorizontal"
             android:layout_width="match_parent"
-            android:layout_height="10dp"
+            android:layout_height="8dp"
             android:layout_marginTop="8dp"
-            android:layout_marginBottom="12dp"
+            android:layout_marginBottom="14dp"
             android:max="1000" />
 
+        <!-- Fila 1: Controles principales de reproducción e imagen -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:gravity="center_vertical"
             android:orientation="horizontal">
 
             <Button
                 android:id="@+id/btnPlayPause"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
+                android:layout_height="44dp"
                 android:focusable="true"
-                android:text="Pausar / Reproducir" />
+                android:minWidth="56dp"
+                android:text="⏸"
+                android:textAllCaps="false"
+                android:textSize="18sp" />
 
             <Button
                 android:id="@+id/btnAudio"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="12dp"
+                android:layout_height="44dp"
+                android:layout_marginStart="10dp"
                 android:focusable="true"
-                android:text="Audio" />
+                android:text="🔊 Audio"
+                android:textAllCaps="false"
+                android:textSize="14sp" />
 
             <Button
                 android:id="@+id/btnSubtitles"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="12dp"
+                android:layout_height="44dp"
+                android:layout_marginStart="10dp"
                 android:focusable="true"
-                android:text="Subtítulos" />
+                android:text="CC"
+                android:textAllCaps="false"
+                android:textSize="15sp"
+                android:textStyle="bold" />
 
             <Button
                 android:id="@+id/btnAspect"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="12dp"
+                android:layout_height="44dp"
+                android:layout_marginStart="10dp"
                 android:focusable="true"
-                android:text="Modo: Estirado 16:9" />
+                android:text="⛶ 16:9"
+                android:textAllCaps="false"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/btnMemc"
+                android:layout_width="wrap_content"
+                android:layout_height="44dp"
+                android:layout_marginStart="10dp"
+                android:focusable="true"
+                android:text="⚡ 60 FPS: ON"
+                android:textAllCaps="false"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/btnImage"
+                android:layout_width="wrap_content"
+                android:layout_height="44dp"
+                android:layout_marginStart="10dp"
+                android:focusable="true"
+                android:text="🎨 Imagen"
+                android:textAllCaps="false"
+                android:textSize="14sp" />
         </LinearLayout>
 
-        <!-- Fila de ajustes de subtítulos (todo operable con D-Pad) -->
+        <!-- Fila 2: Ajustes rápidos de subtítulos -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
+            android:layout_marginTop="10dp"
+            android:gravity="center_vertical"
             android:orientation="horizontal">
 
             <Button
                 android:id="@+id/btnSubSize"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
+                android:layout_height="42dp"
                 android:focusable="true"
-                android:text="Tamaño sub: 100%" />
+                android:text="Aa 100%"
+                android:textAllCaps="false"
+                android:textSize="14sp" />
 
             <Button
                 android:id="@+id/btnSubBg"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="12dp"
+                android:layout_height="42dp"
+                android:layout_marginStart="10dp"
                 android:focusable="true"
-                android:text="Fondo sub: 0%" />
+                android:text="◫ Fondo: 0%"
+                android:textAllCaps="false"
+                android:textSize="14sp" />
 
             <Button
                 android:id="@+id/btnReloadSubs"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="12dp"
+                android:layout_height="42dp"
+                android:layout_marginStart="10dp"
                 android:focusable="true"
-                android:text="Recargar subtítulos" />
+                android:text="↻ Recargar Sub"
+                android:textAllCaps="false"
+                android:textSize="14sp" />
         </LinearLayout>
     </LinearLayout>
 </FrameLayout>
