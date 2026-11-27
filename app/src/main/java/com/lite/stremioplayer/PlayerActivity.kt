@@ -79,8 +79,8 @@ class PlayerActivity : Activity() {
     private var pendingSeekMs = 0L
     private var totalSeekDeltaMs = 0L
 
-    // Estado de interpolación MEMC y control térmico
-    private var userWantsMemc = true
+    // Estado de interpolación MEMC (0 = OFF, 1 = Suave, 2 = Fluido) y control térmico
+    private var userMemcMode = MemcRenderer.MODE_FLUID
     private var memcBypassReason: String? = null
     private var thermalTickCounter = 0
 
@@ -105,13 +105,14 @@ class PlayerActivity : Activity() {
     private val subSizePercentLabels = arrayOf("80%", "100%", "120%", "145%", "170%")
     private var subSizeIndex = 2 // Por defecto: 120% (26sp)
 
+    // Opacidades reales bien diferenciadas en TV (sin sombra opaca detrás)
     private val subBgValues = intArrayOf(
-        Color.TRANSPARENT,
-        Color.argb(102, 0, 0, 0), // 40%
-        Color.argb(166, 0, 0, 0), // 65%
+        Color.TRANSPARENT,        // 0%
+        Color.argb(77, 0, 0, 0),  // 30%
+        Color.argb(153, 0, 0, 0), // 60%
         Color.BLACK               // 100%
     )
-    private val subBgPercentLabels = arrayOf("0%", "40%", "65%", "100%")
+    private val subBgPercentLabels = arrayOf("0%", "30%", "60%", "100%")
     private var subBgIndex = 0
 
     private val progressRunnable = object : Runnable {
@@ -171,14 +172,14 @@ class PlayerActivity : Activity() {
         btnSubBg = findViewById(R.id.btnSubBg)
         btnReloadSubs = findViewById(R.id.btnReloadSubs)
 
-        // Estilizado visual limpio para TV (esquinas redondeadas y foco destacado)
         styleUiElements()
 
         // Cargar preferencias guardadas
         val prefs = getSharedPreferences("player_prefs", Context.MODE_PRIVATE)
         subSizeIndex = prefs.getInt("sub_size_index", 2).coerceIn(0, subSizeValues.lastIndex)
         subBgIndex = prefs.getInt("sub_bg_index", 0).coerceIn(0, subBgValues.lastIndex)
-        userWantsMemc = prefs.getBoolean("memc_enabled", true)
+        val defaultMemc = if (prefs.getBoolean("memc_enabled", true)) MemcRenderer.MODE_FLUID else MemcRenderer.MODE_OFF
+        userMemcMode = prefs.getInt("memc_mode", defaultMemc).coerceIn(MemcRenderer.MODE_OFF, MemcRenderer.MODE_FLUID)
         sharpIndex = prefs.getInt("img_sharp_idx", 0).coerceIn(0, sharpValues.lastIndex)
         contrastIndex = prefs.getInt("img_contrast_idx", 0).coerceIn(0, contrastValues.lastIndex)
         satIndex = prefs.getInt("img_sat_idx", 0).coerceIn(0, satValues.lastIndex)
@@ -219,10 +220,11 @@ class PlayerActivity : Activity() {
                 resetOsdTimer()
                 return@setOnClickListener
             }
-            userWantsMemc = !userWantsMemc
+            // Ciclar: OFF -> Suave -> Fluido -> OFF
+            userMemcMode = (userMemcMode + 1) % 3
             getSharedPreferences("player_prefs", Context.MODE_PRIVATE)
                 .edit()
-                .putBoolean("memc_enabled", userWantsMemc)
+                .putInt("memc_mode", userMemcMode)
                 .apply()
             applyMemcState()
             resetOsdTimer()
@@ -262,13 +264,11 @@ class PlayerActivity : Activity() {
         val radius = 10f * density
         val padH = (14 * density).toInt()
 
-        // Fondo degradado oscuro para el OSD inferior
         osdContainer.background = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
             intArrayOf(Color.argb(180, 10, 10, 14), Color.argb(242, 8, 8, 12))
         )
 
-        // Fondo redondeado para el indicador rápido flotante
         tvQuickFeedback.background = GradientDrawable().apply {
             setColor(Color.argb(215, 16, 16, 22))
             cornerRadius = 24f * density
@@ -314,13 +314,18 @@ class PlayerActivity : Activity() {
 
     private fun applySubtitleStyle() {
         val bgColor = subBgValues[subBgIndex]
-        val edgeType = if (bgColor == Color.TRANSPARENT) {
+        val isTransparentBg = (bgColor == Color.TRANSPARENT)
+
+        // IMPORTANTE: En Media3 Canvas, usar EDGE_TYPE_DROP_SHADOW con fondo semitransparente
+        // hace que Android pinte una sombra negra opaca detrás de la caja, anulando la transparencia.
+        // Usamos EDGE_TYPE_OUTLINE solo en 0% y EDGE_TYPE_NONE en 30%, 60% y 100%.
+        val edgeType = if (isTransparentBg) {
             CaptionStyleCompat.EDGE_TYPE_OUTLINE
         } else {
-            CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW
+            CaptionStyleCompat.EDGE_TYPE_NONE
         }
+        val edgeColor = if (isTransparentBg) Color.BLACK else Color.TRANSPARENT
 
-        // Desactivar estilos embebidos para que el tamaño y la opacidad elegidos SIEMPRE se apliquen
         subtitleView.setApplyEmbeddedStyles(false)
         subtitleView.setApplyEmbeddedFontSizes(false)
         subtitleView.setStyle(
@@ -329,7 +334,7 @@ class PlayerActivity : Activity() {
                 bgColor,
                 Color.TRANSPARENT,
                 edgeType,
-                Color.BLACK,
+                edgeColor,
                 null
             )
         )
@@ -387,7 +392,6 @@ class PlayerActivity : Activity() {
                 }
                 applyImageEnhancements()
                 resetOsdTimer()
-                // Reabrir el diálogo para seguir ajustando cómodamente sin cerrar
                 if (which != 3) {
                     showImageSettingsDialog()
                 } else {
@@ -701,11 +705,12 @@ class PlayerActivity : Activity() {
     }
 
     private fun applyMemcState() {
-        val active = userWantsMemc && memcBypassReason == null
-        surfaceView.setMemcEnabled(active)
+        val effectiveMode = if (memcBypassReason != null) MemcRenderer.MODE_OFF else userMemcMode
+        surfaceView.setMemcMode(effectiveMode)
         btnMemc.text = when {
             memcBypassReason != null -> "⚡ 60 FPS: Auto-OFF"
-            active -> "⚡ 60 FPS: ON"
+            effectiveMode == MemcRenderer.MODE_SOFT -> "⚡ 60 FPS: Suave"
+            effectiveMode == MemcRenderer.MODE_FLUID -> "⚡ 60 FPS: Fluido"
             else -> "⚡ 60 FPS: OFF"
         }
     }
